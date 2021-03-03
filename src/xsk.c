@@ -34,6 +34,13 @@
 #include "libbpf_internal.h"
 #include "xsk.h"
 
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+
 #ifndef SOL_XDP
  #define SOL_XDP 283
 #endif
@@ -103,6 +110,32 @@ struct xdp_mmap_offsets_v1 {
 	struct xdp_ring_offset_v1 fr;
 	struct xdp_ring_offset_v1 cr;
 };
+
+char * sham_start_addr = NULL;
+unsigned long sham_offset = 0;
+
+void * get_shm_addr(int size)
+{
+    key_t key = ftok("/home/wyl/self/selfcode/fd_share/bpf_shm", 1);
+    if (key < 0)
+    {
+        printf("ftok failed\n");
+        return NULL;
+    }
+
+    int id = shmget(key, size, IPC_CREAT | 0777);
+    if (id < 0)
+    {
+        printf("shmget failed\n");
+        return NULL;
+    }
+
+    char * shmaddr = shmat(id, NULL, 0);
+    printf("shm addr %p \n", shmaddr);
+
+    return shmaddr;
+}
+
 
 int xsk_umem__fd(const struct xsk_umem *umem)
 {
@@ -280,58 +313,77 @@ int xsk_umem__create_v0_0_4(struct xsk_umem **umem_ptr, void *umem_area,
 			    __u64 size, struct xsk_ring_prod *fill,
 			    struct xsk_ring_cons *comp,
 			    const struct xsk_umem_config *usr_config)
-{
-	struct xdp_umem_reg mr;
-	struct xsk_umem *umem;
-	int err;
+ {
+     struct xdp_umem_reg mr;
+     struct xsk_umem *umem;
+     int err;
+ 
+     if (!umem_area || !umem_ptr || !fill || !comp)
+         return -EFAULT;
+     if (!size && !xsk_page_aligned(umem_area))
+         return -EINVAL;
+ 
+     // umem = calloc(1, sizeof(*umem));
+     if (NULL == sham_start_addr)
+     {
+         char * addr = get_shm_addr(2048);
+         if (!addr)
+         {
+             printf("xsk_umem__create_v0_0_4, get_shm_addr failed\n");
+         }
+ 
+         umem = (struct xsk_umem *)addr;
+         sham_start_addr = addr;
+         sham_offset     = 0;
+     }
+     else
+     {
+         printf("xsk_umem__create_v0_0_4, error error error error error\n");
+         return -1;
+     }
+     //umem = (struct xsk_umem *)get_shm_addr(sizeof(*umem));
+     if (!umem)
+         return -ENOMEM;
+ 
+     umem->fd = socket(AF_XDP, SOCK_RAW, 0); 
+     if (umem->fd < 0) {
+         err = -errno;
+         goto out_umem_alloc;
+     }
+ 
+     umem->umem_area = umem_area; // umem的起始地址
+     INIT_LIST_HEAD(&umem->ctx_list);
+     xsk_set_umem_config(&umem->config, usr_config);
+ 
+     memset(&mr, 0, sizeof(mr));
+     mr.addr = (uintptr_t)umem_area;
+     mr.len = size;
+     mr.chunk_size = umem->config.frame_size;
+     mr.headroom = umem->config.frame_headroom;
+     mr.flags = umem->config.flags;
+ 
+     err = setsockopt(umem->fd, SOL_XDP, XDP_UMEM_REG, &mr, sizeof(mr));
+     if (err) {
+         err = -errno;
+         goto out_socket;
+     }
+ 
+     err = xsk_create_umem_rings(umem, umem->fd, fill, comp);
+     if (err)
+         goto out_socket;
+ 
+     umem->fill_save = fill;
+     umem->comp_save = comp;
+     *umem_ptr = umem;
+     return 0;
+ 
+ out_socket:
+     close(umem->fd);
+ out_umem_alloc:
+     free(umem);
+     return err;
+ }
 
-	if (!umem_area || !umem_ptr || !fill || !comp)
-		return -EFAULT;
-	if (!size && !xsk_page_aligned(umem_area))
-		return -EINVAL;
-
-	umem = calloc(1, sizeof(*umem));
-	if (!umem)
-		return -ENOMEM;
-
-	umem->fd = socket(AF_XDP, SOCK_RAW, 0);
-	if (umem->fd < 0) {
-		err = -errno;
-		goto out_umem_alloc;
-	}
-
-	umem->umem_area = umem_area;
-	INIT_LIST_HEAD(&umem->ctx_list);
-	xsk_set_umem_config(&umem->config, usr_config);
-
-	memset(&mr, 0, sizeof(mr));
-	mr.addr = (uintptr_t)umem_area;
-	mr.len = size;
-	mr.chunk_size = umem->config.frame_size;
-	mr.headroom = umem->config.frame_headroom;
-	mr.flags = umem->config.flags;
-
-	err = setsockopt(umem->fd, SOL_XDP, XDP_UMEM_REG, &mr, sizeof(mr));
-	if (err) {
-		err = -errno;
-		goto out_socket;
-	}
-
-	err = xsk_create_umem_rings(umem, umem->fd, fill, comp);
-	if (err)
-		goto out_socket;
-
-	umem->fill_save = fill;
-	umem->comp_save = comp;
-	*umem_ptr = umem;
-	return 0;
-
-out_socket:
-	close(umem->fd);
-out_umem_alloc:
-	free(umem);
-	return err;
-}
 
 struct xsk_umem_config_v1 {
 	__u32 fill_size;
@@ -733,6 +785,7 @@ static struct xsk_ctx *xsk_get_ctx(struct xsk_umem *umem, int ifindex,
 		return NULL;
 
 	list_for_each_entry(ctx, &umem->ctx_list, list) {
+        ctx = (struct xsk_ctx *)((char *)umem + 128);
 		if (ctx->ifindex == ifindex && ctx->queue_id == queue_id) {
 			ctx->refcount++;
 			return ctx;
@@ -773,7 +826,17 @@ static struct xsk_ctx *xsk_create_ctx(struct xsk_socket *xsk,
 	struct xsk_ctx *ctx;
 	int err;
 
-	ctx = calloc(1, sizeof(*ctx));
+    if (NULL == sham_start_addr)
+    {
+        printf("xsk_create_ctx, error error error error\n");
+        return NULL;
+    }
+
+	// ctx = calloc(1, sizeof(*ctx));
+	// ctx = (struct xsk_ctx *)get_shm_addr(sizeof(*ctx));
+	// size是80
+	ctx = (struct xsk_ctx *)(sham_start_addr + 128);
+    printf("------------- ctx %p, sizeof(*ctx) %ld, shm addr %p \n", ctx, sizeof(*ctx), sham_start_addr);
 	if (!ctx)
 		return NULL;
 
